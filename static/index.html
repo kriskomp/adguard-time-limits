@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>adguard-time-limits</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background:#0f1115; color:#e6e6e6;}
+  h1 { font-size: 1.3rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2d35; font-size: 0.9rem; vertical-align: middle; }
+  button { cursor: pointer; border: none; border-radius: 6px; padding: 0.35rem 0.7rem; margin: 2px; font-size: 0.85rem; color: white; }
+  .grant { background:#2e7d32; }
+  .block { background:#c62828; }
+  .edit { background:#1565c0; }
+  .del { background:#444; }
+  .status-allowed { color:#66bb6a; font-weight:600; }
+  .status-blocked { color:#ef5350; font-weight:600; }
+  .ips { font-family: ui-monospace, monospace; font-size: 0.85rem; }
+  form.add { display:flex; gap:0.5rem; margin-top:1.5rem; flex-wrap:wrap; align-items:center; }
+  input { padding: 0.4rem; border-radius:6px; border:1px solid #333; background:#1a1d24; color:#eee; }
+  #f_ips { min-width: 18rem; flex: 1 1 18rem; }
+  .hint { color:#888; font-size:0.8rem; }
+  .banner { margin-top:1rem; padding:0.6rem 0.8rem; border-radius:6px; font-size:0.9rem; display:none; }
+  .banner.warn { display:block; background:#4a1f1f; border:1px solid #c62828; }
+  .banner.ok { display:block; background:#1b3a22; border:1px solid #2e7d32; }
+  .dns { font-family: ui-monospace, monospace; font-size: 0.78rem; color:#aaa; }
+  .dns.bad { color:#ff8a80; font-weight:600; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  #hist td { font-size: 0.8rem; }
+</style>
+</head>
+<body>
+  <h1>adguard-time-limits - limity czasu internetu</h1>
+  <table id="tbl">
+    <thead><tr><th>Nazwa</th><th>Adresy IP</th><th>Status</th><th>Zostało (min)</th><th>Dziś (min)</th><th>Ostatnie zapytanie DNS</th><th>Akcje</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="diag" class="banner"></div>
+
+  <form class="add" id="form">
+    <input id="f_name" placeholder="nazwa np. telewizor" required>
+    <input id="f_ips" placeholder="adresy IP po przecinku, np. 192.168.8.207, 192.168.8.208" required>
+    <input id="f_limit" type="number" min="0" placeholder="dzienny limit (min, 0=brak)" value="0">
+    <button class="grant" type="submit">Zapisz profil</button>
+  </form>
+  <p class="hint">
+    Jeden profil może mieć kilka adresów IP (np. kabel i WiFi tego samego urządzenia) - blokada obejmuje wszystkie naraz.
+    Zapis profilu o istniejącej nazwie aktualizuje jego adresy i limit dzienny (przycisk "Edytuj" wypełnia formularz).
+    Nowy profil jest od razu zablokowany, dopóki nie dodasz mu czasu.
+  </p>
+  <p class="hint">
+    Odświeżanie co 10 s. Reguła blokady w AdGuard (Filtry → Własne reguły, linia /.*/$client=...) jest zarządzana przez ten serwis - nie edytuj jej ręcznie.
+  </p>
+
+  <h2>Historia zmian (ostatnie 50)</h2>
+  <table id="hist">
+    <thead><tr><th>Czas</th><th>Profil</th><th>Zdarzenie</th><th>Szczegóły</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+async function api(path, opts, quiet) {
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    if (!quiet) alert('Brak połączenia z serwisem');
+    throw e;
+  }
+  if (!r.ok) {
+    let msg = await r.text();
+    try { const j = JSON.parse(msg); if (j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch (_) {}
+    if (!quiet) alert('Błąd: ' + msg);
+    throw new Error(msg);
+  }
+  return r.status === 204 ? null : r.json();
+}
+
+function td(text, cls) {
+  const c = document.createElement('td');
+  c.textContent = text;
+  if (cls) c.className = cls;
+  return c;
+}
+
+function btn(label, cls, handler) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = label;
+  b.className = cls;
+  b.addEventListener('click', handler);
+  return b;
+}
+
+const post = (path, body) => api(path, {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: body === undefined ? undefined : JSON.stringify(body)
+});
+
+function fmtTime(v) {
+  const d = typeof v === 'number' ? new Date(v * 1000) : new Date(v);
+  return isNaN(d) ? '-' : d.toLocaleString('pl-PL');
+}
+
+function renderDiag(d) {
+  const box = document.getElementById('diag');
+  box.className = 'banner';
+  if (!d) { return; }
+  if (d.scheduler_last_tick_age_s === null || d.scheduler_last_tick_age_s > 120) {
+    box.className = 'banner warn';
+    box.textContent = 'UWAGA: scheduler nie działa (ostatni obieg ' +
+      (d.scheduler_last_tick_age_s === null ? 'nigdy' : d.scheduler_last_tick_age_s + ' s temu') +
+      '). Czas nie jest odliczany i blokady się nie aktualizują.';
+  } else if (d.adguard_error) {
+    box.className = 'banner warn';
+    box.textContent = 'Brak połączenia z AdGuard: ' + d.adguard_error;
+  } else if (d.in_sync === false) {
+    box.className = 'banner warn';
+    box.textContent = 'UWAGA: AdGuard ma inną listę blokad niż panel. Panel: [' +
+      d.db_blocked.join(', ') + ']  AdGuard: [' + (d.adguard_disallowed || []).join(', ') + ']';
+  } else if (d.in_sync === true) {
+    box.className = 'banner ok';
+    box.textContent = 'AdGuard zgodny z panelem. Zablokowane adresy: ' +
+      (d.db_blocked.length ? d.db_blocked.join(', ') : 'brak');
+  }
+}
+
+async function refresh() {
+  let profiles, diag = null, events = [];
+  try { profiles = await api('/profiles', undefined, true); } catch (_) { return; }
+  try { diag = await api('/diagnostics', undefined, true); } catch (_) {}
+  try { events = await api('/events?limit=50', undefined, true); } catch (_) {}
+  renderDiag(diag);
+  const hb = document.querySelector('#hist tbody');
+  hb.innerHTML = '';
+  for (const e of events) {
+    const tr = document.createElement('tr');
+    tr.appendChild(td(fmtTime(e.ts)));
+    tr.appendChild(td(e.profile));
+    tr.appendChild(td(e.event));
+    tr.appendChild(td(e.detail));
+    hb.appendChild(tr);
+  }
+  const tbody = document.querySelector('#tbl tbody');
+  tbody.innerHTML = '';
+  for (const p of profiles) {
+    const tr = document.createElement('tr');
+    tr.appendChild(td(p.name));
+    tr.appendChild(td(p.ips.join(', '), 'ips'));
+    tr.appendChild(td(p.status === 'allowed' ? 'dozwolony' : 'zablokowany', 'status-' + p.status));
+    tr.appendChild(td(p.remaining_grant_min > 100000 ? '∞' : Math.round(p.remaining_grant_min)));
+    tr.appendChild(td(Math.round(p.used_today_min) + (p.daily_limit_min ? ' / ' + p.daily_limit_min : '')));
+
+    const dnsCell = document.createElement('td');
+    for (const ip of p.ips) {
+      const q = diag && diag.last_queries ? diag.last_queries[ip] : null;
+      const line = document.createElement('div');
+      line.className = 'dns';
+      if (q && q.time) {
+        const after = new Date(q.time).getTime() > p.updated_at * 1000 + 30000;
+        line.textContent = ip + ': ' + fmtTime(q.time) + ' ' + (q.domain || '');
+        if (p.status === 'blocked' && after) {
+          line.className = 'dns bad';
+          line.title = 'Adres jest zablokowany, a AdGuard nadal widzi od niego zapytania po czasie blokady';
+        }
+      } else {
+        line.textContent = ip + ': brak w ostatnich wpisach';
+      }
+      dnsCell.appendChild(line);
+    }
+    tr.appendChild(dnsCell);
+
+    const actions = document.createElement('td');
+    const enc = encodeURIComponent(p.name);
+    actions.appendChild(btn('+30 min', 'grant', async () => { await post(`/profiles/${enc}/grant`, {minutes: 30}); refresh(); }));
+    actions.appendChild(btn('+60 min', 'grant', async () => { await post(`/profiles/${enc}/grant`, {minutes: 60}); refresh(); }));
+    actions.appendChild(btn('Blokuj', 'block', async () => { await post(`/profiles/${enc}/block`); refresh(); }));
+    actions.appendChild(btn('Edytuj', 'edit', () => {
+      document.getElementById('f_name').value = p.name;
+      document.getElementById('f_ips').value = p.ips.join(', ');
+      document.getElementById('f_limit').value = p.daily_limit_min;
+      document.getElementById('f_ips').focus();
+    }));
+    actions.appendChild(btn('Usuń', 'del', async () => {
+      if (!confirm('Usunąć profil ' + p.name + '?')) return;
+      await api(`/profiles/${enc}`, {method: 'DELETE'});
+      refresh();
+    }));
+    tr.appendChild(actions);
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById('form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const name = document.getElementById('f_name').value.trim();
+  const ips = document.getElementById('f_ips').value.split(/[\s,;]+/).filter(Boolean);
+  const daily_limit_min = parseInt(document.getElementById('f_limit').value || '0', 10);
+  try {
+    await post('/profiles', {name, ips, daily_limit_min});
+  } catch (_) { return; }
+  ev.target.reset();
+  document.getElementById('f_limit').value = 0;
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

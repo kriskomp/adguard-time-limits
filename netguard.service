@@ -1,0 +1,22 @@
+[Unit]
+Description=netguard - limity czasu internetu per urzadzenie
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netguard
+Group=netguard
+WorkingDirectory=/opt/netguard
+EnvironmentFile=/etc/netguard/netguard.env
+ExecStart=/opt/netguard/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
