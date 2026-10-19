@@ -68,6 +68,10 @@ def _clean_ips(p: ProfileIn) -> list[str]:
     return cleaned
 
 
+MAX_GRANT_MIN = 1440               # maks. jednorazowa zmiana czasu (doba)
+UNLIMITED_THRESHOLD_MIN = 100000   # powyżej = "bez limitu" (zob. /unblock)
+
+
 class GrantIn(BaseModel):
     minutes: int = 30
 
@@ -255,9 +259,34 @@ async def api_delete_profile(name: str):
 async def api_grant(name: str, body: GrantIn):
     if not db.get_profile(name):
         raise HTTPException(404, "brak takiego profilu")
+    if not 1 <= body.minutes <= MAX_GRANT_MIN:
+        raise HTTPException(400, f"minuty muszą być w zakresie 1-{MAX_GRANT_MIN}")
     db.grant_minutes(name, body.minutes)
     db.add_event(name, "grant", f"+{body.minutes} min -> dostęp przyznany")
     await sync_adguard_from_db("grant")
+    return db.get_profile(name)
+
+
+@app.post("/profiles/{name}/subtract")
+async def api_subtract(name: str, body: GrantIn):
+    """Odejmuje minuty od przyznanego czasu (korekta po dodaniu za dużo)."""
+    p = db.get_profile(name)
+    if not p:
+        raise HTTPException(404, "brak takiego profilu")
+    if not 1 <= body.minutes <= MAX_GRANT_MIN:
+        raise HTTPException(400, f"minuty muszą być w zakresie 1-{MAX_GRANT_MIN}")
+    if p["status"] != "allowed":
+        raise HTTPException(409, "profil jest zablokowany - nie ma czasu do odjęcia")
+    if p["remaining_grant_min"] > UNLIMITED_THRESHOLD_MIN:
+        raise HTTPException(409, "dostęp bez limitu - użyj Blokuj")
+    remaining = db.subtract_minutes(name, body.minutes)
+    if remaining <= 0:
+        db.set_status(name, "blocked", reset_session=True)
+        db.add_event(name, "subtract", f"-{body.minutes} min -> czas wyczerpany, blokada")
+        await sync_adguard_from_db("subtract")
+        await notify_ha("Internet zablokowany", f"{name}: czas wyczerpany po korekcie (-{body.minutes} min).")
+    else:
+        db.add_event(name, "subtract", f"-{body.minutes} min -> zostało {round(remaining)} min")
     return db.get_profile(name)
 
 
