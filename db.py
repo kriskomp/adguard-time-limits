@@ -220,6 +220,24 @@ def grant_minutes(name: str, minutes: int):
         )
 
 
+def subtract_minutes(name: str, minutes: int) -> float:
+    """
+    Odejmuje minuty od pozostałego, przyznanego czasu (np. gdy ktoś dodał za dużo).
+    Nie schodzi poniżej 0. Nie zmienia used_today_min (to czas faktycznie zużyty).
+    Zwraca nową wartość remaining_grant_min.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE profiles SET remaining_grant_min = MAX(0, remaining_grant_min - ?), "
+            "updated_at = ? WHERE name = ? AND status = 'allowed'",
+            (minutes, time.time(), name),
+        )
+        row = conn.execute(
+            "SELECT remaining_grant_min FROM profiles WHERE name=?", (name,)
+        ).fetchone()
+        return row["remaining_grant_min"] if row else 0.0
+
+
 def set_status(name: str, status: str, reset_session: bool = False):
     with get_conn() as conn:
         if reset_session:
