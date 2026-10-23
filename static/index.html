@@ -176,9 +176,10 @@ async function refresh() {
 
     const actions = document.createElement('td');
     const enc = encodeURIComponent(p.name);
+    actions.appendChild(btn('+15 min', 'grant', async () => { await post(`/profiles/${enc}/grant`, {minutes: 15}); refresh(); }));
     actions.appendChild(btn('+30 min', 'grant', async () => { await post(`/profiles/${enc}/grant`, {minutes: 30}); refresh(); }));
     actions.appendChild(btn('+60 min', 'grant', async () => { await post(`/profiles/${enc}/grant`, {minutes: 60}); refresh(); }));
-    actions.appendChild(btn('-30 min', 'sub', async () => { await post(`/profiles/${enc}/subtract`, {minutes: 30}); refresh(); }));
+    actions.appendChild(btn('-15 min', 'sub', async () => { await post(`/profiles/${enc}/subtract`, {minutes: 15}); refresh(); }));
     actions.appendChild(btn('Blokuj', 'block', async () => { await post(`/profiles/${enc}/block`); refresh(); }));
     actions.appendChild(btn('Edytuj', 'edit', () => {
       document.getElementById('f_name').value = p.name;
