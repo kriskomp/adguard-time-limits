@@ -12,7 +12,8 @@ Built as a free replacement for the paid parental-control time limits of consume
 ## How it works
 
 - You define **profiles** (e.g. `TV`) with one or more IP addresses (a TV often has a wired and a Wi-Fi address).
-- You **grant minutes** (`+30`, `+60`) in the panel or via the API. The profile becomes *allowed* and the clock runs.
+- You **grant minutes** (`+15`, `+30`, `+60` buttons) in the panel or via the API. The profile becomes *allowed* and the clock runs.
+- Granted too much? The **-15 min** button (API: `/subtract`) takes minutes back; at 0 the profile is blocked immediately.
 - Every 30 s a scheduler counts the time. When the granted time is used up, the profile is **blocked**.
 - Blocking is done by one managed AdGuard **custom filtering rule**:
   `/.*/$client=192.168.1.20|192.168.1.21` – every DNS query from those clients gets an instant refusal.
@@ -89,7 +90,8 @@ Panel: `http://<host>:8088/`. Set the container/host time zone correctly
 |---|---|---|
 | GET / POST | `/profiles` | list / create-or-update profile (`name`, `ips`, `daily_limit_min`) |
 | DELETE | `/profiles/{name}` | delete profile |
-| POST | `/profiles/{name}/grant` | add minutes (`{"minutes": 30}`) |
+| POST | `/profiles/{name}/grant` | add minutes (`{"minutes": 30}`, range 1-1440) |
+| POST | `/profiles/{name}/subtract` | take minutes back (`{"minutes": 15}`, range 1-1440); 409 if blocked or unlimited |
 | POST | `/profiles/{name}/block` · `/unblock` | manual block / unblock |
 | GET | `/events` | history |
 | GET | `/diagnostics` | expected vs actual AdGuard state, last DNS query per IP |
