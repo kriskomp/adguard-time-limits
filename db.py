@@ -6,6 +6,12 @@ informacji o tym, kto jest zablokowany i ile czasu zużył.
 Profil może mieć wiele adresów IP (np. telewizor: kabel LAN i WiFi).
 Adresy trzymane są w osobnej tabeli profile_ips, a każdy adres może
 należeć tylko do jednego profilu.
+
+Profil ma rodzaj (kolumna kind):
+  device   - urządzenie w sieci, egzekwowane blokadą DNS w AdGuard (ma adresy IP)
+  minidlna - usługa MiniDLNA na OpenMediaVault, włączana/wyłączana przez OMV
+             (nie ma adresów IP)
+Czas (przyznane minuty, dzienny limit, statusy) działa tak samo dla obu rodzajów.
 """
 import sqlite3
 import time
@@ -18,6 +24,7 @@ DB_PATH.parent.mkdir(exist_ok=True)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
     name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'device',           -- device | minidlna
     daily_limit_min INTEGER NOT NULL DEFAULT 0,   -- 0 = brak dziennego limitu, steruje tylko "grant"
     used_today_min REAL NOT NULL DEFAULT 0,
     remaining_grant_min REAL NOT NULL DEFAULT 0,   -- ile minut "doładowanego" czasu zostało
@@ -43,6 +50,8 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 """
 
 EVENTS_KEEP_DAYS = 90
+KINDS = ("device", "minidlna")     # dozwolone rodzaje profili
+SERVICE_KINDS = ("minidlna",)      # rodzaje bez adresów IP (usługi zewnętrzne)
 
 
 class IpInUseError(Exception):
@@ -112,6 +121,13 @@ def _migrate_single_ip_schema(conn):
         raise
 
 
+def _migrate_add_kind(conn):
+    """Starsze bazy nie mają kolumny kind - wszystkie dotychczasowe profile to urządzenia."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)")]
+    if cols and "kind" not in cols:
+        conn.execute("ALTER TABLE profiles ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'")
+
+
 def init_db():
     with get_conn() as conn:
         exists = conn.execute(
@@ -119,6 +135,7 @@ def init_db():
         ).fetchone()
         if exists:
             _migrate_single_ip_schema(conn)
+            _migrate_add_kind(conn)
         conn.executescript(SCHEMA)
         conn.execute("DELETE FROM events WHERE ts < ?", (time.time() - EVENTS_KEEP_DAYS * 86400,))
 
@@ -139,9 +156,10 @@ def _with_ips(conn, rows):
     return result
 
 
-def upsert_profile(name: str, ips: list[str], daily_limit_min: int):
+def upsert_profile(name: str, ips: list[str], daily_limit_min: int, kind: str = "device"):
     """
     Tworzy profil albo aktualizuje istniejący (limit dzienny i CAŁĄ listę adresów).
+    Rodzaj (kind) ustala się przy tworzeniu; istniejącemu profilowi nie jest zmieniany.
     Stan czasu (status, pozostały czas) istniejącego profilu zostaje bez zmian.
     Rzuca IpInUseError, jeśli któryś adres należy do innego profilu
     (wtedy cała operacja jest wycofana).
@@ -150,13 +168,13 @@ def upsert_profile(name: str, ips: list[str], daily_limit_min: int):
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO profiles (name, daily_limit_min, day_stamp, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO profiles (name, kind, daily_limit_min, day_stamp, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 daily_limit_min=excluded.daily_limit_min,
                 updated_at=excluded.updated_at
             """,
-            (name, daily_limit_min, today_stamp(), now),
+            (name, kind, daily_limit_min, today_stamp(), now),
         )
         conn.execute("DELETE FROM profile_ips WHERE profile_name=?", (name,))
         for ip in ips:

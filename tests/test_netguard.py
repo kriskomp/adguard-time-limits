@@ -392,4 +392,199 @@ for bad in (0, -5, 1441):
 run(app.api_unblock("telewizor"))
 expect(409, app.api_subtract("telewizor", app.GrantIn(minutes=30)), "tryb bez limitu -> 409 (użyj Blokuj)")
 
+print("T12 migracja kolumny kind (baza sprzed profili usług)")
+path = fresh_db()
+conn = sqlite3.connect(path)
+conn.executescript(
+    """
+    CREATE TABLE profiles (
+        name TEXT PRIMARY KEY, daily_limit_min INTEGER NOT NULL DEFAULT 0,
+        used_today_min REAL NOT NULL DEFAULT 0, remaining_grant_min REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'blocked', session_started_at REAL, day_stamp TEXT,
+        last_notified_min INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0);
+    CREATE TABLE profile_ips (ip TEXT PRIMARY KEY, profile_name TEXT NOT NULL);
+    INSERT INTO profiles (name, remaining_grant_min, status) VALUES ('telewizor', 20, 'allowed');
+    INSERT INTO profile_ips VALUES ('192.168.8.207', 'telewizor');
+    """
+)
+conn.commit()
+conn.close()
+db.init_db()
+p = db.get_profile("telewizor")
+check(p["kind"] == "device" and p["remaining_grant_min"] == 20 and p["status"] == "allowed",
+      "istniejący profil dostał kind=device, stan czasu nietknięty")
+db.init_db()
+check(db.get_profile("telewizor")["kind"] == "device", "powtórne init_db nic nie psuje")
+
+print("T13 profil usługi MiniDLNA (OMV) na atrapie klienta")
+
+
+class FakeOmv:
+    configured = True
+
+    def __init__(self):
+        self.enabled = None
+        self.calls = []
+        self.fail = None
+
+    async def set_enabled(self, enabled):
+        self.calls.append(enabled)
+        if self.fail:
+            raise app.OmvError(self.fail)
+        self.enabled = enabled
+        return {"enabled": enabled, "active": enabled}
+
+
+def reset_services():
+    app._service_state.clear()
+    app._service_task = None
+    app._service_rerun = None
+
+
+async def service_scenario():
+    fresh_db()
+    db.init_db()
+    reset_services()
+    fo = FakeOmv()
+    app.omv = fo
+    calls.clear()
+    app.TICK_SECONDS = 60.0
+
+    async def settle():
+        await app.flush_services()
+
+    async def expect_async(status, coro, label):
+        try:
+            await coro
+        except HTTPException as e:
+            check(e.status_code == status, label)
+            return
+        raise AssertionError("NIE PRZESZŁO (brak wyjątku): " + label)
+
+    res = await app.api_upsert_profile(app.ProfileIn(name="dlna", kind="minidlna"))
+    await settle()
+    check(res["kind"] == "minidlna" and res["ips"] == [] and res["status"] == "blocked", "profil usługi: bez IP, domyślnie zablokowany")
+    check(fo.calls == [False] and calls == [], "utworzenie wyłącza usługę w OMV i nie rusza AdGuard")
+    check(db.blocked_ips() == set(), "profil usługi nie trafia na listę blokad DNS")
+    await expect_async(409, app.api_upsert_profile(app.ProfileIn(name="dlna2", kind="minidlna")), "drugi profil MiniDLNA -> 409")
+    await expect_async(422, app.api_upsert_profile(app.ProfileIn(name="x", kind="minidlna", ips=["10.0.0.5"])), "profil usługi z IP -> 422")
+    await expect_async(422, app.api_upsert_profile(app.ProfileIn(name="x", kind="coś")), "nieznany rodzaj -> 422")
+    await expect_async(409, app.api_upsert_profile(app.ProfileIn(name="dlna", kind="device", ips=["10.0.0.5"])), "zmiana rodzaju istniejącego profilu -> 409")
+    res = await app.api_upsert_profile(app.ProfileIn(name="dlna", daily_limit_min=90))
+    check(res["kind"] == "minidlna" and res["daily_limit_min"] == 90, "edycja bez podania rodzaju zachowuje rodzaj")
+    await settle()
+
+    fo.calls.clear()
+    res = await app.api_grant("dlna", app.GrantIn(minutes=30))
+    await settle()
+    check(fo.calls == [True] and fo.enabled is True, "grant włącza MiniDLNA")
+    check(calls == [], "grant usługi nie dotyka AdGuard")
+    check(res["service"]["desired"] is True, "odpowiedź API niesie stan usługi")
+    await app.api_grant("dlna", app.GrantIn(minutes=15))
+    await settle()
+    check(fo.calls == [True], "kolejny grant nie wdraża zmian ponownie (stan już zgodny)")
+
+    await app.api_upsert_profile(app.ProfileIn(name="tv", ips=["10.0.0.9"]))
+    await app.api_grant("tv", app.GrantIn(minutes=10))
+    await settle()
+    check(fo.calls == [True], "operacje na urządzeniu nie wywołują OMV")
+
+    await app.api_subtract("dlna", app.GrantIn(minutes=15))
+    await settle()
+    check(fo.enabled is True, "odjęcie części czasu nie wyłącza usługi")
+    await app.api_subtract("dlna", app.GrantIn(minutes=500))
+    await settle()
+    check(fo.enabled is False and db.get_profile("dlna")["status"] == "blocked", "odjęcie całego czasu wyłącza usługę")
+
+    await app.api_grant("dlna", app.GrantIn(minutes=1))
+    await settle()
+    check(fo.enabled is True, "ponowny grant włącza usługę")
+    await app.scheduler_tick()      # 1 minuta -> czas się kończy
+    await settle()
+    check(db.get_profile("dlna")["status"] == "blocked" and fo.enabled is False, "koniec czasu w schedulerze wyłącza usługę")
+    ev = [e["event"] for e in db.list_events(30, "dlna")]
+    check("time_expired" in ev and "service_off" in ev and "service_on" in ev, "historia: time_expired, service_on, service_off")
+
+    # awaria OMV: błąd widoczny raz w historii, ponawianie w kolejnych tickach, powrót do zgodności
+    fo.fail = "ssh: connection refused"
+    await app.api_grant("dlna", app.GrantIn(minutes=30))
+    await settle()
+    check(fo.enabled is False and app._service_state["dlna"]["error"], "OMV niedostępny: błąd zapisany, usługa nie zmieniona")
+    for _ in range(3):
+        await app.scheduler_tick()
+        await settle()
+    fails = [e for e in db.list_events(50, "dlna") if e["event"] == "service_FAIL"]
+    check(len(fails) == 1, "powtarzający się ten sam błąd zapisany w historii tylko raz")
+    d = await app.api_diagnostics()
+    check(d["services"][0]["in_sync"] is False and d["services"][0]["error"], "diagnostyka pokazuje rozjazd usługi")
+    fo.fail = None
+    await app.scheduler_tick()
+    await settle()
+    check(fo.enabled is True and not app._service_state["dlna"]["error"], "po powrocie OMV scheduler sam doprowadza usługę do stanu")
+    d = await app.api_diagnostics()
+    check(d["services"][0]["in_sync"] is True and d["services"][0]["actual"] is True, "diagnostyka: usługa zgodna")
+
+    # rozjazd po stronie OMV (ktoś wyłączył ręcznie) naprawia okresowy reconcile
+    fo.enabled = False
+    fo.calls.clear()
+    await app.scheduler_tick(force_reconcile=True)
+    await settle()
+    check(fo.enabled is True and fo.calls == [True], "reconcile przywraca stan usługi")
+
+    # usunięcie profilu wyłącza usługę
+    await app.api_delete_profile("dlna")
+    await settle()
+    check(fo.enabled is False and "dlna" not in app._service_state, "usunięcie profilu wyłącza usługę i czyści stan")
+
+    # restart netguard: stan z bazy wymusza wyłączenie usługi (OMV mógł wstać z włączoną)
+    await app.api_upsert_profile(app.ProfileIn(name="dlna", kind="minidlna"))
+    await settle()
+    reset_services()
+    fo.enabled = True
+    app.schedule_service_sync("start", force=True)
+    await settle()
+    check(fo.enabled is False, "po restarcie zablokowany profil => MiniDLNA wyłączone")
+
+    # nieskonfigurowany OMV: czytelny błąd zamiast wyjątku
+    import omv_client
+    app.omv = omv_client.OmvClient("", "root", "")
+    reset_services()
+    app.schedule_service_sync("test")
+    await settle()
+    check("nie jest skonfigurowany" in (app._service_state["dlna"]["error"] or ""), "brak konfiguracji OMV -> komunikat o błędzie")
+
+
+asyncio.run(service_scenario())
+
+print("T14 klient OMV: parsowanie odpowiedzi skryptu i komendy SSH")
+import omv_client
+
+
+class StubOmv(omv_client.OmvClient):
+    def __init__(self, rc, out, err=""):
+        super().__init__("192.168.8.8", "root", "/etc/netguard/omv_key", known_hosts="/opt/netguard/data/known_hosts")
+        self.res, self.words = (rc, out, err), []
+
+    async def _run(self, word):
+        self.words.append(word)
+        return self.res
+
+
+c = StubOmv(0, "enabled=true active=active")
+st = asyncio.run(c.set_enabled(True))
+check(st == {"enabled": True, "active": True} and c.words == ["start"], "set_enabled(True) -> komenda start")
+c = StubOmv(0, "enabled=false active=inactive")
+check(asyncio.run(c.set_enabled(False)) == {"enabled": False, "active": False} and c.words == ["stop"], "set_enabled(False) -> komenda stop")
+check(asyncio.run(c.status())["enabled"] is False and c.words[-1] == "status", "status -> komenda status")
+for rc, out in ((3, "enabled=true active=inactive"), (0, "śmieci"), (255, "")):
+    try:
+        asyncio.run(StubOmv(rc, out, "boom").status())
+        raised = False
+    except omv_client.OmvError:
+        raised = True
+    check(raised, f"kod={rc} / niepoprawny wynik -> OmvError")
+argv = omv_client.OmvClient("h", "root", "/k", 2222, "/kh")._argv("stop")
+check(argv[0] == "ssh" and argv[-1] == "stop" and "root@h" in argv and "BatchMode=yes" in argv and "2222" in argv
+      and "UserKnownHostsFile=/kh" in argv, "wiersz poleceń ssh: klucz, port, BatchMode, known_hosts, tylko słowo-komenda")
+
 print(f"\nWSZYSTKIE TESTY PRZESZŁY ({passed} sprawdzeń)")
