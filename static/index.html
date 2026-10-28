@@ -27,20 +27,25 @@
   .banner.ok { display:block; background:#1b3a22; border:1px solid #2e7d32; }
   .dns { font-family: ui-monospace, monospace; font-size: 0.78rem; color:#aaa; }
   .dns.bad { color:#ff8a80; font-weight:600; }
+  select { padding: 0.4rem; border-radius:6px; border:1px solid #333; background:#1a1d24; color:#eee; }
   h2 { font-size: 1.05rem; margin-top: 2rem; }
   #hist td { font-size: 0.8rem; }
 </style>
 </head>
 <body>
-  <h1>adguard-time-limits - limity czasu internetu</h1>
+  <h1>adguard-time-limits - limity czasu (internet i usługi)</h1>
   <table id="tbl">
-    <thead><tr><th>Nazwa</th><th>Adresy IP</th><th>Status</th><th>Zostało (min)</th><th>Dziś (min)</th><th>Ostatnie zapytanie DNS</th><th>Akcje</th></tr></thead>
+    <thead><tr><th>Nazwa</th><th>Adresy IP / usługa</th><th>Status</th><th>Zostało (min)</th><th>Dziś (min)</th><th>Ostatnie zapytanie DNS / stan usługi</th><th>Akcje</th></tr></thead>
     <tbody></tbody>
   </table>
 
   <div id="diag" class="banner"></div>
 
   <form class="add" id="form">
+    <select id="f_kind" title="Rodzaj profilu">
+      <option value="device">Urządzenie (blokada DNS)</option>
+      <option value="minidlna">MiniDLNA na OMV</option>
+    </select>
     <input id="f_name" placeholder="nazwa np. telewizor" required>
     <input id="f_ips" placeholder="adresy IP po przecinku, np. 192.168.8.207, 192.168.8.208" required>
     <input id="f_limit" type="number" min="0" placeholder="dzienny limit (min, 0=brak)" value="0">
@@ -50,6 +55,10 @@
     Jeden profil może mieć kilka adresów IP (np. kabel i WiFi tego samego urządzenia) - blokada obejmuje wszystkie naraz.
     Zapis profilu o istniejącej nazwie aktualizuje jego adresy i limit dzienny (przycisk "Edytuj" wypełnia formularz).
     Nowy profil jest od razu zablokowany, dopóki nie dodasz mu czasu.
+  </p>
+  <p class="hint">
+    Profil "MiniDLNA na OMV" nie ma adresów IP: dopóki ma czas, usługa MiniDLNA na OpenMediaVault jest włączona,
+    a gdy czas się skończy (albo klikniesz Blokuj) - wyłączona. Można mieć tylko jeden taki profil.
   </p>
   <p class="hint">
     Odświeżanie co 10 s. Reguła blokady w AdGuard (Filtry → Własne reguły, linia /.*/$client=...) jest zarządzana przez ten serwis - nie edytuj jej ręcznie.
@@ -118,6 +127,10 @@ function renderDiag(d) {
   } else if (d.adguard_error) {
     box.className = 'banner warn';
     box.textContent = 'Brak połączenia z AdGuard: ' + d.adguard_error;
+  } else if ((d.services || []).some(s => !s.in_sync && s.error)) {
+    const s = d.services.find(x => !x.in_sync && x.error);
+    box.className = 'banner warn';
+    box.textContent = 'UWAGA: usługa "' + s.name + '" (OMV) nie zgadza się z panelem: ' + s.error;
   } else if (d.in_sync === false) {
     box.className = 'banner warn';
     box.textContent = 'UWAGA: AdGuard ma inną listę blokad niż panel. Panel: [' +
@@ -125,7 +138,9 @@ function renderDiag(d) {
   } else if (d.in_sync === true) {
     box.className = 'banner ok';
     box.textContent = 'AdGuard zgodny z panelem. Zablokowane adresy: ' +
-      (d.db_blocked.length ? d.db_blocked.join(', ') : 'brak');
+      (d.db_blocked.length ? d.db_blocked.join(', ') : 'brak') +
+      (d.services && d.services.length ? '. Usługi: ' + d.services.map(s => s.name + ' ' +
+        (s.actual === null ? '?' : (s.actual ? 'włączona' : 'wyłączona'))).join(', ') : '');
   }
 }
 
@@ -150,13 +165,29 @@ async function refresh() {
   for (const p of profiles) {
     const tr = document.createElement('tr');
     tr.appendChild(td(p.name));
-    tr.appendChild(td(p.ips.join(', '), 'ips'));
+    const isSvc = p.kind && p.kind !== 'device';
+    tr.appendChild(td(isSvc ? 'MiniDLNA (OMV)' : p.ips.join(', '), 'ips'));
     tr.appendChild(td(p.status === 'allowed' ? 'dozwolony' : 'zablokowany', 'status-' + p.status));
     tr.appendChild(td(p.remaining_grant_min > 100000 ? '∞' : Math.round(p.remaining_grant_min)));
     tr.appendChild(td(Math.round(p.used_today_min) + (p.daily_limit_min ? ' / ' + p.daily_limit_min : '')));
 
     const dnsCell = document.createElement('td');
-    for (const ip of p.ips) {
+    if (isSvc) {
+      const sv = p.service || {};
+      const line = document.createElement('div');
+      line.className = 'dns';
+      if (sv.error) {
+        line.className = 'dns bad';
+        line.textContent = 'OMV: błąd - ' + sv.error;
+      } else if (sv.actual === null || sv.actual === undefined) {
+        line.textContent = sv.configured === false ? 'OMV nieskonfigurowany (OMV_HOST/OMV_SSH_KEY)' : 'OMV: oczekiwanie na zastosowanie zmiany...';
+      } else {
+        line.textContent = 'OMV: MiniDLNA ' + (sv.actual ? 'włączona' : 'wyłączona') +
+          (sv.checked_at ? ' (' + fmtTime(sv.checked_at) + ')' : '');
+      }
+      dnsCell.appendChild(line);
+    }
+    for (const ip of (isSvc ? [] : p.ips)) {
       const q = diag && diag.last_queries ? diag.last_queries[ip] : null;
       const line = document.createElement('div');
       line.className = 'dns';
@@ -182,10 +213,12 @@ async function refresh() {
     actions.appendChild(btn('-15 min', 'sub', async () => { await post(`/profiles/${enc}/subtract`, {minutes: 15}); refresh(); }));
     actions.appendChild(btn('Blokuj', 'block', async () => { await post(`/profiles/${enc}/block`); refresh(); }));
     actions.appendChild(btn('Edytuj', 'edit', () => {
+      document.getElementById('f_kind').value = p.kind || 'device';
+      updateKind();
       document.getElementById('f_name').value = p.name;
       document.getElementById('f_ips').value = p.ips.join(', ');
       document.getElementById('f_limit').value = p.daily_limit_min;
-      document.getElementById('f_ips').focus();
+      document.getElementById(isSvc ? 'f_limit' : 'f_ips').focus();
     }));
     actions.appendChild(btn('Usuń', 'del', async () => {
       if (!confirm('Usunąć profil ' + p.name + '?')) return;
@@ -200,15 +233,26 @@ async function refresh() {
 document.getElementById('form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const name = document.getElementById('f_name').value.trim();
-  const ips = document.getElementById('f_ips').value.split(/[\s,;]+/).filter(Boolean);
+  const kind = document.getElementById('f_kind').value;
+  const ips = kind === 'device' ? document.getElementById('f_ips').value.split(/[\s,;]+/).filter(Boolean) : [];
   const daily_limit_min = parseInt(document.getElementById('f_limit').value || '0', 10);
   try {
-    await post('/profiles', {name, ips, daily_limit_min});
+    await post('/profiles', {name, kind, ips, daily_limit_min});
   } catch (_) { return; }
   ev.target.reset();
   document.getElementById('f_limit').value = 0;
+  updateKind();
   refresh();
 });
+
+function updateKind() {
+  const dev = document.getElementById('f_kind').value === 'device';
+  const ips = document.getElementById('f_ips');
+  ips.style.display = dev ? '' : 'none';
+  ips.required = dev;
+}
+document.getElementById('f_kind').addEventListener('change', updateKind);
+updateKind();
 
 refresh();
 setInterval(refresh, 10000);
